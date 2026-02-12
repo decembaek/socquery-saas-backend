@@ -3,6 +3,8 @@
 SocQuery 에이전트 관리 SaaS의 백엔드 API 서버입니다.  
 Cloudflare Workers + Hono + D1 기반으로 동작하며, AWS IoT Core와 연동하여 에이전트 장비를 프로비저닝합니다.
 
+decembaek/socquery-saas-backend
+
 ---
 
 ## 기술 스택
