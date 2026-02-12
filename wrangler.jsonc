@@ -1,0 +1,49 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "socquery-saas-backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-02-09",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "socquery-saas-d1",
+      "database_id": "fe1fc09e-6577-44a3-b875-cf15f7c6e950",
+    },
+  ],
+  "vars": {
+    "AWS_ACCOUNT_ID": "456986379725",
+    "AWS_REGION": "ap-northeast-2",
+    "JWT_ACCESS_EXPIRES_IN": "900", // 15분
+    "JWT_REFRESH_EXPIRES_IN": "604800", // 7일
+  },
+  // "compatibility_flags": [
+  //   "nodejs_compat"
+  // ],
+
+  // "kv_namespaces": [
+  //   {
+  //     "binding": "MY_KV_NAMESPACE",
+  //     "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  //   }
+  // ],
+  // "r2_buckets": [
+  //   {
+  //     "binding": "MY_BUCKET",
+  //     "bucket_name": "my-bucket"
+  //   }
+  // ],
+  // "d1_databases": [
+  //   {
+  //     "binding": "MY_DB",
+  //     "database_name": "my-database",
+  //     "database_id": ""
+  //   }
+  // ],
+  // "ai": {
+  //   "binding": "AI"
+  // },
+  // "observability": {
+  //   "enabled": true,
+  //   "head_sampling_rate": 1
+  // }
+}
