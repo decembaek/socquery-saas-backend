@@ -1,988 +1,322 @@
 # SocQuery SaaS Backend
 
-SocQuery 에이전트 관리 SaaS의 백엔드 API 서버입니다.  
-Cloudflare Workers + Hono + D1 기반으로 동작하며, AWS IoT Core와 연동하여 에이전트 장비를 프로비저닝합니다.
+Go 장비 에이전트의 등록, 모니터링 이벤트, 원격 명령을 관리하는 백엔드 API입니다.
 
-decembaek/socquery-saas-backend
+**백승규([decembaek](https://github.com/decembaek))가 개인 프로젝트로 단독 설계·개발했습니다.**
+Cloudflare Workers·Hono·D1과 AWS IoT Core를 연결했습니다.
+에이전트 코드는 [socquery-agent-go](https://github.com/decembaek/socquery-agent-go)에 있습니다.
 
----
+## 해결하려는 문제
 
-## 기술 스택
+여러 PC·서버에 설치한 프로그램의 상태를 확인하고, 장비를 그룹으로 묶어
+이상 징후와 명령 실행 결과를 한곳에서 관리하는 구조를 만들었습니다.
+각 장비가 직접 SaaS 데이터베이스에 접근하는 대신, MQTT와 HTTP API로 역할을 나눴습니다.
 
-| 항목          | 기술                                     |
-| ------------- | ---------------------------------------- |
-| 런타임        | Cloudflare Workers                       |
-| 프레임워크    | Hono v4                                  |
-| 데이터베이스  | Cloudflare D1 (SQLite)                   |
-| 인증          | JWT (Access + Refresh Token Rotation)    |
-| 비밀번호 해싱 | PBKDF2-SHA256 (Web Crypto API)           |
-| AWS 연동      | aws4fetch (SigV4 서명)                   |
-| IoT           | AWS IoT Core (Thing + 인증서 프로비저닝) |
+이 프로젝트의 에이전트는 장비에 설치되는 Go 프로그램입니다.
+이 저장소는 웹 UI를 포함하지 않는 API 서버이며, 장비 프로그램은 별도 저장소입니다.
 
----
+## 구현 범위
 
-## 프로젝트 구조
+| 영역 | 현재 코드에 있는 기능 |
+| --- | --- |
+| 사용자·계정 | 회원가입, 로그인, 토큰 갱신·로그아웃, 내 정보, 계정 목록·전환, 비밀번호 변경 |
+| 장비 등록 | 등록 토큰 발급·조회, 만료·사용 여부 확인, AWS 인증서·Thing 프로비저닝 |
+| 장비 관리 | 계정별 목록·상세·수정·삭제, 그룹 분류, 이벤트·명령 이력 조회 |
+| 명령 전달 | AWS IoT HTTPS Publish, 명령 상태 기록, 응답 웹훅으로 결과 반영 |
+| 모니터링 | 상태·스캔·시스템·이상치 이벤트 수신, 마지막 통신 시각과 이력 저장 |
+| 알림 | 그룹 규칙, 발생 이력, 5분 쿨다운, 이메일·웹훅 채널과 템플릿 |
+| 데이터 | 계정·사용자·장비·그룹·이벤트·명령·알림의 SQL 마이그레이션 8개 |
 
-```
-socquery-saas-backend/
-├── src/
-│   ├── index.ts                 # 앱 진입점 (Hono 라우터 + 미들웨어 + 에이전트 등록 API)
-│   ├── types.ts                 # 타입 정의 (Bindings, JWT Payload, DB Row 타입)
-│   ├── middleware/
-│   │   └── auth.ts              # JWT 인증 미들웨어
-│   ├── routes/
-│   │   └── auth.ts              # 인증 라우트 (회원가입/로그인/토큰갱신/로그아웃)
-│   └── utils/
-│       ├── crypto.ts            # 비밀번호 해싱 (PBKDF2), SHA-256, UUID 생성
-│       └── jwt.ts               # JWT 생성/검증 유틸리티
-├── migrations/
-│   └── 001_initial_schema.sql   # D1 초기 스키마 (accounts, users, refresh_tokens)
-├── wrangler.jsonc               # Cloudflare Workers 설정
-├── package.json
-└── tsconfig.json
-```
+구현 위치와 설계는 아래에, 실행 확인 범위는 검증 항목에 정리했습니다.
 
----
+## 전체 구조
 
-## 시스템 아키텍처
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          SocQuery SaaS 웹 콘솔                           │
-│                                                                          │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────┐  ┌───────────────────┐  │
-│  │ 회원가입  │  │  로그인   │  │  장비 등록     │  │  장비 모니터링     │  │
-│  └─────┬────┘  └─────┬────┘  └──────┬────────┘  └────────┬──────────┘  │
-└────────┼─────────────┼──────────────┼─────────────────────┼─────────────┘
-         │             │              │                     │
-         ▼             ▼              ▼                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    SocQuery SaaS Backend (이 프로젝트)                    │
-│                    Cloudflare Workers + Hono + D1                        │
-│                                                                          │
-│  /api/v1/auth/*          → 인증 (JWT)                                    │
-│  /api/v1/register-agent  → 장비 등록 (AWS IoT 프로비저닝)                 │
-│  /api/v1/iot/webhook     → IoT Core 규칙 수신 (이벤트 처리)              │
-│                                                                          │
-└──────────────────────────────┬──────────────────────────────────────────┘
-                               │
-              ┌────────────────┼────────────────┐
-              ▼                                 ▼
-┌──────────────────────┐          ┌──────────────────────────────────────┐
-│   Cloudflare D1      │          │          AWS IoT Core                │
-│                      │          │                                      │
-│  accounts            │          │  1. 인증서 + 키 쌍 생성              │
-│  users               │          │  2. Thing(사물) 생성                 │
-│  account_users       │          │  3. Thing ↔ 인증서 연결              │
-│  refresh_tokens      │          │  4. 정책(Policy) 할당               │
-│  agents              │          │                                      │
-│  agent_events        │          │  ── IoT Core 규칙 (Rules Engine) ──  │
-│                      │          │  SELECT * FROM 'socquery/+/status'   │
-└──────────────────────┘          │    → HTTPS Action                    │
-         ▲                        │    → POST /api/v1/iot/webhook        │
-         │                        └──────────────────┬───────────────────┘
-         │  DB 업데이트                               │
-         │  (상태, 이벤트 저장)                        │ mTLS (포트 8883)
-         │                                            ▼
-         │                        ┌──────────────────────────────────────┐
-         │                        │        Client Agent (Go)             │
-         │                        │                                      │
-         └────────────────────────│  MQTT Publish                        │
-           IoT Rule → Webhook     │  socquery/{tenant_id}/{thingName}/status                 │
-           → Backend 처리         │  socquery/{tenant_id}/{thingName}/telemetry             │
-                                  │  socquery/{tenant_id}/{thingName}/response                               │
-                                  └──────────────────────────────────────┘
+```mermaid
+flowchart LR
+    U["웹 클라이언트 / API 호출자"] -->|"JWT 인증 · 장비/그룹/명령 API"| B["Workers + Hono"]
+    A["Go 장비 에이전트"] -->|"등록 토큰 + machineId"| B
+    B -->|"계정 · 장비 · 이벤트 · 명령"| D[("D1")]
+    B -->|"인증서 · Thing · 정책 연결"| I["AWS IoT Core"]
+    B -->|"서명한 HTTPS Publish"| I
+    I -->|"MQTT 명령"| A
+    A -->|"MQTT 상태 · 스캔 · 이상치 · 응답"| I
+    I -->|"IoT Rule → HTTPS 웹훅"| B
+    B -->|"규칙 일치 시"| N["이메일 / 외부 웹훅"]
 ```
 
----
+1. 사용자가 로그인한 계정에서 장비 등록 토큰을 발급합니다.
+2. Go 에이전트가 토큰과 장비 식별자를 보내면 서버가 AWS IoT 연결 정보를 발급합니다.
+3. 에이전트의 MQTT 메시지는 별도로 구성한 IoT Rule을 거쳐 서버 웹훅으로 전달됩니다.
+4. 서버는 이벤트와 장비 상태를 저장하고, 이상치에 그룹 규칙·알림 채널을 적용합니다.
+5. 명령 API는 MQTT로 발행한 뒤 응답 웹훅을 통해 실행 결과를 기록합니다.
 
-## 전체 동작 플로우
+AWS IoT 정책·Rule·IAM 권한·HTTPS Action 설정은 별도 준비가 필요합니다.
+저장소에 이를 일괄 구성하는 인프라 자동화 코드는 포함되어 있지 않습니다.
+등록 API가 참조하는 정책 이름은 `src/routes/agents.ts`의 `policyName` 상수와 맞아야 합니다.
 
-### 1단계: 사용자 인증
+## 설계와 기술의 역할
 
-```
-사용자 ──── POST /api/v1/auth/register ────→ 백엔드
-       ←── { access_token, refresh_token } ──┘
+| 구성 | 코드에서 맡는 역할 |
+| --- | --- |
+| TypeScript·Hono | API 라우팅, 인증 미들웨어, 요청·응답 처리 |
+| Cloudflare Workers | HTTP 요청을 처리하는 실행 환경 |
+| D1 | 계정과 장비의 관계, 이벤트·명령·알림 이력을 SQL로 저장 |
+| AWS IoT Core | 장비 인증서·Thing 관리, 에이전트와 MQTT 메시지 교환 |
+| aws4fetch | AWS API 요청에 SigV4 서명을 적용 |
+| Web Crypto·Hono JWT | PBKDF2 비밀번호 해싱, 토큰 난수·해시, HS256 액세스 토큰 |
+| Resend / HTTP 웹훅 | 그룹 알림의 외부 전송 경로 |
 
-사용자 ──── POST /api/v1/auth/login ───────→ 백엔드
-       ←── { access_token, refresh_token } ──┘
-```
+### 계정과 장비 등록을 분리
 
-### 2단계: 장비 등록 토큰 발급
+일반 관리 API는 JWT의 `account_id`를 기준으로 장비·그룹을 조회합니다.
+장비 등록은 사용자 JWT 대신 등록 토큰을 사용하며, 토큰에 연결된 계정·그룹을 상속합니다.
+등록 토큰은 난수로 만들고 DB에는 SHA-256 해시를 저장합니다.
+기본 유효 시간은 1시간이며, 코드상 최대값은 24시간입니다.
 
-```
-웹 콘솔에서 "장비 등록" 클릭
-  │
-  ▼
-백엔드가 등록 토큰 생성 (JWT 또는 일회용 토큰)
-  │
-  ▼
-OS별 설치 커맨드 + 토큰을 사용자에게 제공
+### 사용자 세션과 장비 인증의 수명을 구분
 
-  ┌─────────────────────────────────────────────────────────┐
-  │  Linux / macOS:                                         │
-  │  curl -sL https://install.socquery.com | sh             │
-  │  ./agent --token "eyJhbGciOi..."                        │
-  │                                                         │
-  │  Windows (PowerShell):                                  │
-  │  irm https://install.socquery.com/win | iex             │
-  │  .\agent.exe --token "eyJhbGciOi..."                    │
-  └─────────────────────────────────────────────────────────┘
-```
+액세스 토큰은 기본 15분, refresh token은 기본 7일입니다.
+Refresh token은 해시 저장·회전·폐기하며, 비밀번호 변경 시 해당 사용자의 refresh token을 폐기합니다.
+발급된 액세스 토큰을 즉시 무효화하는 별도 목록은 구현되어 있지 않습니다.
+장비 연결 정보는 AWS 프로비저닝 이후 등록 응답으로 반환합니다.
 
-### 3단계: 에이전트 → 백엔드 등록 요청
+### 명령의 전달과 실행 결과를 구분
 
-```
-Agent                              Backend                         AWS IoT Core
-  │                                   │                                │
-  │  POST /api/v1/register-agent      │                                │
-  │  { token, machineId }             │                                │
-  │ ─────────────────────────────────→│                                │
-  │                                   │  1. 토큰 검증                   │
-  │                                   │  2. 인증서+키 생성 요청          │
-  │                                   │ ──────────────────────────────→│
-  │                                   │←── certificatePem, privateKey  │
-  │                                   │                                │
-  │                                   │  3. Thing 생성                  │
-  │                                   │ ──────────────────────────────→│
-  │                                   │                                │
-  │                                   │  4. Thing ↔ 인증서 연결         │
-  │                                   │ ──────────────────────────────→│
-  │                                   │                                │
-  │                                   │  5. 정책 할당                   │
-  │                                   │ ──────────────────────────────→│
-  │                                   │                                │
-  │←── { thingName, tenant_id,        │                                │
-  │      certificatePem, privateKey,   │                                │
-  │      iotEndpoint, region }         │                                │
-  │                                   │                                │
-  │  6. machineID로 AES-256-GCM       │                                │
-  │     암호화 후 로컬 저장            │                                │
-  │                                   │                                │
-  │  7. 인증서로 mTLS MQTT 연결        │                                │
-  │ ══════════════════════════════════════════════════════════════════→│
-  │                                   │                                │
-  │  8. socquery/{thingName}/status    │                                │
-  │     { "status": "online" }         │                                │
-  │ ══════════════════════════════════════════════════════════════════→│
+명령을 D1에 `pending`으로 저장하고 AWS Publish 성공 시 `delivered`로 변경합니다.
+이 상태는 AWS가 발행 요청을 수락했다는 뜻입니다.
+장비 실행 성공은 응답 웹훅의 `exitCode === 0`을 받아 `completed`로 기록할 때 구분합니다.
+`timeout` 값은 저장·전달하지만, 응답 누락을 자동으로 만료 처리하는 작업은 없습니다.
+
+### 이상치 규칙과 전송 채널을 분리
+
+그룹마다 지표·비교 연산·임계값·지속 시간과 이메일/웹훅 채널을 설정합니다.
+이상치의 `details` 등을 비교해 조건이 맞으면 발생 이력을 저장한 뒤 알림을 보냅니다.
+같은 규칙·장비의 최근 발생 이력이 있으면 5분 동안 알림을 건너뜁니다.
+이는 현재 구현 방식이며 중복 전송이나 유실이 없다는 보장은 아닙니다.
+
+구현 위치: [인증](src/routes/auth.ts), [장비·그룹·명령](src/routes/agents.ts),
+[이벤트·알림](src/routes/iot.ts), [암호화 유틸리티](src/utils/crypto.ts).
+
+## 로컬 빠른 시작
+
+Node.js와 npm이 필요합니다. lockfile의 Wrangler 4.63.0은 Node.js `>=20.0.0`을 요구합니다.
+의존성은 저장소의 lockfile로 설치합니다.
+
+```sh
+git clone https://github.com/decembaek/socquery-saas-backend.git
+cd socquery-saas-backend
+npm ci
 ```
 
-### 4단계: 에이전트 통신 (등록 이후)
+프로젝트 루트에 아래 `.dev.vars`를 직접 만들고 로컬 전용 값으로 바꿉니다.
+이 파일은 Git 추적 대상에서 제외되어 있습니다.
 
-```
-Agent                                              AWS IoT Core
-  │                                                     │
-  │  구독: socquery/{thingName}/command                  │
-  │ ←══════════════════════════════════════════════════ │
-  │                                                     │
-  │  발행: socquery/{thingName}/status                   │
-  │ ══════════════════════════════════════════════════→ │
-  │                                                     │
-  │  발행: socquery/{thingName}/telemetry                │
-  │ ══════════════════════════════════════════════════→ │
-  │                                                     │
-  │  발행: socquery/{thingName}/response                 │
-  │ ══════════════════════════════════════════════════→ │
-  │                                                     │
-  │  종료 시: { "status": "offline" } 발행 후 연결 해제  │
-  │ ══════════════════════════════════════════════════→ │
+```dotenv
+JWT_SECRET="<local-development-signing-secret>"
+IOT_WEBHOOK_SECRET="<local-development-webhook-secret>"
 ```
 
-### 5단계: IoT Core 규칙 → 백엔드 웹훅
+`wrangler.jsonc`의 D1 바인딩 이름은 `DB`입니다.
+로컬 마이그레이션과 서버 시작은 다음과 같습니다.
 
-에이전트가 MQTT로 발행한 메시지를 AWS IoT Core 규칙 엔진이 캐치하여 백엔드 HTTPS 엔드포인트로 전달합니다.
-
-```
-Agent                       AWS IoT Core                      Backend
-  │                              │                                │
-  │  PUBLISH                     │                                │
-  │  socquery/{thingName}/status │                                │
-  │  {"status":"online",...}     │                                │
-  │ ════════════════════════════→│                                │
-  │                              │                                │
-  │                              │  ── Rules Engine ──            │
-  │                              │  SQL: SELECT *,                │
-  │                              │       topic(2) AS thingName    │
-  │                              │       FROM 'socquery/+/status' │
-  │                              │                                │
-  │                              │  Action: HTTPS POST            │
-  │                              │ ──────────────────────────────→│
-  │                              │  POST /api/v1/iot/webhook      │
-  │                              │  Header: X-IoT-Secret: {key}   │
-  │                              │  Body: {                       │
-  │                              │    "thingName": "device-abc",  │
-  │                              │    "topic": "socquery/.../status",
-  │                              │    "event": "status",          │
-  │                              │    "payload": {                │
-  │                              │      "status": "online",       │
-  │                              │      "thingName": "...",       │
-  │                              │      "tenantId": "..."         │
-  │                              │    },                          │
-  │                              │    "timestamp": 1707500000     │
-  │                              │  }                             │
-  │                              │                                │
-  │                              │                                │  1. 시크릿 검증
-  │                              │                                │  2. 이벤트 타입 라우팅
-  │                              │                                │  3. agents 테이블 업데이트
-  │                              │                                │  4. agent_events 기록
-  │                              │                                │
-  │                              │           ←── 200 OK ──────── │
-  │                              │                                │
+```sh
+npm run seedLocalDb
+npx wrangler dev
 ```
 
-**같은 방식으로 telemetry, response 토픽도 처리:**
+`seedLocalDb`는 `wrangler d1 migrations apply DB --local`을 실행합니다.
+`npm run dev`를 사용하면 로컬 마이그레이션과 서버 시작을 순서대로 수행합니다.
+Wrangler가 표시한 주소에서 확인합니다. 기본 주소를 사용한 예시는 다음과 같습니다.
 
-```
-Agent                       AWS IoT Core                      Backend
-  │                              │                                │
-  │  PUBLISH                     │                                │
-  │  socquery/{thingName}/       │                                │
-  │    telemetry                 │  Rule: socquery/+/telemetry    │
-  │  {"cpu":45,"mem":72,...}     │ ──────────────────────────────→│  agent_events INSERT
-  │ ════════════════════════════→│                                │
-  │                              │                                │
-  │  PUBLISH                     │                                │
-  │  socquery/{thingName}/       │                                │
-  │    response                  │  Rule: socquery/+/response     │
-  │  {"commandId":"...",         │ ──────────────────────────────→│  명령 실행 결과 저장
-  │   "result":{...}}            │                                │
-  │ ════════════════════════════→│                                │
+```sh
+curl http://127.0.0.1:8787/api/v1/health
 ```
 
----
+로컬 D1과 인증 API는 AWS 자격증명 없이 확인할 수 있습니다.
+장비 등록·삭제·명령 발행은 로컬 서버에서도 실제 AWS HTTP 요청을 수행합니다.
+알림 채널을 활성화하면 실제 이메일·외부 웹훅 요청도 수행합니다.
+빠른 시작은 AWS·Resend가 필요한 기능까지 가상화하는 환경이 아닙니다.
 
-## API 명세
+### 환경 변수와 바인딩
 
-### Base URL
+| 이름 | 쓰임 | 필요한 범위 |
+| --- | --- | --- |
+| `DB` | Cloudflare D1 바인딩 | DB를 사용하는 API |
+| `JWT_SECRET` | HS256 액세스 토큰 서명·검증 | 인증·관리 API |
+| `JWT_ACCESS_EXPIRES_IN` | 액세스 토큰 수명(초), 기본 `900` | 설정값·기본값 사용 가능 |
+| `JWT_REFRESH_EXPIRES_IN` | refresh token 수명(초), 기본 `604800` | 설정값·기본값 사용 가능 |
+| `AWS_ACCESS_KEY_ID` | AWS 요청 서명용 자격증명 | 프로비저닝·삭제·명령 발행 |
+| `AWS_SECRET_ACCESS_KEY` | AWS 요청 서명용 자격증명 | 프로비저닝·삭제·명령 발행 |
+| `AWS_REGION` | AWS IoT API 리전 | AWS 연동 |
+| `IOT_ATS_ENDPOINT` | 스킴 없는 IoT Data endpoint 호스트 | 등록 응답·명령 발행 |
+| `IOT_WEBHOOK_SECRET` | `X-IoT-Secret` 헤더와 비교 | 이벤트 웹훅 |
+| `RESEND_API_KEY` | Resend API 인증 | 이메일 알림 사용 시 |
+| `RESEND_FROM_EMAIL` | Resend 발신 주소 | 이메일 알림 사용 시 |
+| `AWS_ACCOUNT_ID` | Wrangler 설정에 있는 값, 현재 소스에서는 미사용 | 현 API의 필수 입력 아님 |
 
-```
-/api/v1
-```
+추가 연동값은 `.dev.vars`에 본인 환경에 맞게 설정합니다.
+예를 들어 `IOT_ATS_ENDPOINT="<your-endpoint>-ats.iot.<region>.amazonaws.com"`처럼
+호스트만 입력하며 실제 운영 자격증명·endpoint·계정 ID를 문서나 예제에 넣지 않습니다.
+배포 환경은 본인의 D1과 AWS 리소스로 구성하고, 민감값은 Worker secrets로 관리합니다.
+`src/types.ts`의 수동 바인딩 타입과 `worker-configuration.d.ts`의 생성 타입은 구분되어 있습니다.
+Wrangler 설정을 바꾼 뒤에는 `npm run cf-typegen`으로 생성 타입을 갱신할 수 있습니다.
 
----
+## API 핵심 요약
 
-### 인증 API (`/auth/*`)
+모든 경로의 공통 접두사는 `/api/v1`입니다.
+JWT는 `Authorization: Bearer <access-token>` 헤더로 전달합니다.
 
-#### `POST /auth/register` - 회원가입
+| 메서드·경로 | 인증 | 역할 |
+| --- | --- | --- |
+| `GET /health` | 없음 | 서버 응답 확인 |
+| `POST /auth/register`, `POST /auth/login` | 없음 | 가입·로그인 |
+| `POST /auth/refresh` | refresh token | 토큰 갱신 |
+| `POST /auth/logout`, `PUT /auth/password` | JWT | 세션 폐기·비밀번호 변경 |
+| `GET /auth/me`, `GET /auth/accounts` | JWT | 사용자·소속 계정 조회 |
+| `POST /auth/switch-account` | JWT | 소속 확인 후 계정 전환 |
+| `POST /agents/tokens`, `GET /agents/tokens` | JWT | 등록 토큰 발급·조회 |
+| `POST /agents/register` | 등록 토큰 | 장비 프로비저닝 |
+| `GET /agents`, `GET/PUT/DELETE /agents/:id` | JWT | 장비 관리 |
+| `GET /agents/:id/events` | JWT | 이벤트 이력 |
+| `POST/GET /agents/:id/commands` | JWT | 명령 발행·이력 |
+| `GET/POST /agents/groups`, `GET/PUT/DELETE /agents/groups/:id` | JWT | 그룹 관리 |
+| `GET/POST /agents/groups/:id/rules` | JWT | 규칙 조회·생성 |
+| `PUT/DELETE /agents/groups/:groupId/rules/:ruleId` | JWT | 규칙 수정·삭제 |
+| `GET/POST /agents/groups/:id/alert-channels` | JWT | 알림 채널 조회·생성 |
+| `PUT/DELETE /agents/groups/:groupId/alert-channels/:channelId` | JWT | 채널 수정·삭제 |
+| `GET /agents/groups/:id/alerts`, `GET /agents/groups/:id/alerts-summary` | JWT | 알림 이력·요약 |
+| `GET /iot/webhook` | 없음 | `{ "ok": true }` 응답 |
+| `POST /iot/webhook` | 공유 시크릿 | IoT 이벤트 수신 |
 
-| 항목 | 값     |
-| ---- | ------ |
-| 인증 | 불필요 |
+등록 토큰 발급에는 `display_name`이 필요하며 `group_id`, `expires_in`을 선택할 수 있습니다.
+장비 등록 입력은 `{ "token": "<registration-token>", "machineId": "<machine-id>" }`입니다.
+`free` 계정에는 현재 장비 수 3개 제한 검사 코드가 있습니다.
+목록 API의 필터·페이지 매개변수와 전체 입력 필드는 각 라우트 소스를 기준으로 확인합니다.
 
-**Request:**
+## MQTT와 IoT 웹훅 계약
+
+기준 토픽 구조는 `socquery/{tenant_id}/{thingName}/{category}/{action}`입니다.
+서버는 Go 에이전트와 직접 MQTT 연결을 유지하지 않고 AWS HTTPS Publish API를 호출합니다.
+
+### 서버에서 장비로 보내는 명령
+
+발행 토픽은 `socquery/{account_id}/{thingName}/agent/command`, QoS는 `1`입니다.
+HTTP 명령 API와 MQTT 메시지는 다음 필드를 사용합니다.
 
 ```json
 {
-  "email": "user@example.com",
-  "password": "mypassword123",
-  "name": "홍길동",
-  "account_name": "우리회사",
-  "device_info": "web-chrome"
+  "commandId": "<command-id>",
+  "action": "<agent-supported-action>",
+  "params": {},
+  "timeout": 30
 }
 ```
 
-**Response (201):**
+`commandId`는 서버가 생성하며 HTTP 입력에는 `action`, 선택적 `params`·`timeout`을 보냅니다.
+지원 action과 파라미터는 Go 에이전트 구현을 함께 확인해야 합니다.
+서버와 에이전트의 필드·지원 명령 호환성을 검증한 통합 테스트는 아직 제공하지 않습니다.
+
+### 장비에서 서버로 들어오는 이벤트
+
+IoT Rule은 토픽의 계정·장비·분류를 추출해 다음과 같은 **최상위 필드**로 전달해야 합니다.
+서버는 `event`와 중첩 `payload`만 있는 이전 예제를 그대로 해석하지 않습니다.
 
 ```json
 {
-  "user": {
-    "id": "uuid",
-    "email": "user@example.com",
-    "name": "홍길동",
-    "role": "admin",
-    "account_id": "uuid"
-  },
-  "access_token": "eyJhbGciOi...",
-  "refresh_token": "a1b2c3d4e5...",
-  "expires_in": 900
-}
-```
-
-**처리 로직:**
-
-1. 이메일 중복 확인
-2. 비밀번호 PBKDF2 해싱 (100,000 iterations)
-3. account + user + account_users 트랜잭션 생성
-4. Access Token (15분) + Refresh Token (7일) 발급
-
----
-
-#### `POST /auth/login` - 로그인
-
-| 항목 | 값     |
-| ---- | ------ |
-| 인증 | 불필요 |
-
-**Request:**
-
-```json
-{
-  "email": "user@example.com",
-  "password": "mypassword123",
-  "device_info": "web-chrome"
-}
-```
-
-**Response (200):**
-
-```json
-{
-  "user": {
-    "id": "...",
-    "email": "...",
-    "name": "...",
-    "role": "...",
-    "account_id": "..."
-  },
-  "access_token": "eyJhbGciOi...",
-  "refresh_token": "a1b2c3d4e5...",
-  "expires_in": 900
-}
-```
-
----
-
-#### `POST /auth/refresh` - 토큰 갱신
-
-| 항목 | 값                              |
-| ---- | ------------------------------- |
-| 인증 | 불필요 (refresh_token으로 인증) |
-
-**Request:**
-
-```json
-{
-  "refresh_token": "a1b2c3d4e5...",
-  "device_info": "web-chrome"
-}
-```
-
-**Response (200):**
-
-```json
-{
-  "access_token": "eyJhbGciOi...(새 토큰)",
-  "refresh_token": "f6g7h8i9j0...(새 토큰)",
-  "expires_in": 900
-}
-```
-
-**처리 로직:**
-
-- Refresh Token Rotation: 사용된 토큰은 즉시 폐기하고 새 토큰 발급
-- 만료/폐기된 토큰으로 요청 시 401 반환
-
----
-
-#### `POST /auth/logout` - 로그아웃
-
-| 항목 | 값                                     |
-| ---- | -------------------------------------- |
-| 인증 | `Authorization: Bearer <access_token>` |
-
-**Request:**
-
-```json
-{
-  "refresh_token": "a1b2c3d4e5...",
-  "logout_all": false
-}
-```
-
-- `logout_all: true` → 모든 디바이스에서 로그아웃 (모든 refresh token 폐기)
-- `refresh_token` 지정 → 해당 세션만 로그아웃
-
----
-
-#### `GET /auth/me` - 현재 사용자 정보
-
-| 항목 | 값                                     |
-| ---- | -------------------------------------- |
-| 인증 | `Authorization: Bearer <access_token>` |
-
-**Response (200):**
-
-```json
-{
-  "user": {
-    "id": "uuid",
-    "account_id": "uuid",
-    "email": "user@example.com",
-    "name": "홍길동",
-    "role": "admin",
-    "status": "active",
-    "created_at": 1707500000,
-    "updated_at": 1707500000
-  }
-}
-```
-
----
-
-#### `PUT /auth/password` - 비밀번호 변경
-
-| 항목 | 값                                     |
-| ---- | -------------------------------------- |
-| 인증 | `Authorization: Bearer <access_token>` |
-
-**Request:**
-
-```json
-{
-  "current_password": "oldpassword",
-  "new_password": "newpassword123"
-}
-```
-
-**처리 로직:**
-
-- 현재 비밀번호 검증 후 변경
-- 변경 시 모든 refresh token 폐기 (재로그인 강제)
-
----
-
-### 에이전트 등록 API
-
-#### `POST /register-agent` - 장비 등록
-
-| 항목 | 값                    |
-| ---- | --------------------- |
-| 인증 | 등록 토큰 (구현 예정) |
-
-**Request (에이전트 → 백엔드):**
-
-```json
-{
-  "token": "웹 콘솔에서 발급받은 등록 토큰",
-  "machineId": "OS별 고유 머신 ID (SHA-256 해시)"
-}
-```
-
-**Response (200):**
-
-```json
-{
-  "success": true,
-  "thingName": "socquery-agent-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "tenant_id": "account-uuid",
-  "certificatePem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
-  "privateKey": "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----",
-  "iotEndpoint": "xxxxx-ats.iot.ap-northeast-2.amazonaws.com",
-  "region": "ap-northeast-2"
-}
-```
-
-**백엔드 처리 순서:**
-
-| 단계 | 작업                      | AWS IoT API                                   |
-| ---- | ------------------------- | --------------------------------------------- |
-| 1    | 등록 토큰 검증            | -                                             |
-| 2    | 인증서 + 키 쌍 생성       | `POST /keys-and-certificate?setAsActive=true` |
-| 3    | Thing(사물) 생성          | `POST /things/{thingName}`                    |
-| 4    | Thing ↔ 인증서 연결       | `PUT /thing-principals/{thingName}`           |
-| 5    | 정책 할당                 | `PUT /target-policies/{policyName}`           |
-| 6    | 에이전트에 연결 정보 반환 | -                                             |
-
----
-
-### IoT 웹훅 API (`/iot/*`)
-
-AWS IoT Core Rules Engine이 호출하는 엔드포인트입니다. 사용자가 직접 호출하지 않습니다.
-
-#### `POST /iot/webhook` - IoT Core 이벤트 수신
-
-| 항목   | 값                                       |
-| ------ | ---------------------------------------- |
-| 인증   | `X-IoT-Secret` 헤더 (공유 시크릿)        |
-| 호출자 | AWS IoT Core Rules Engine (HTTPS Action) |
-
-**Request (IoT Core → 백엔드):**
-
-```json
-{
-  "thingName": "socquery-agent-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "event": "status",
-  "ts": 1707500000000,
+  "thingName": "<registered-thing-name>",
+  "tenantId": "<account-id>",
+  "category": "agent",
+  "action": "status",
   "status": "online",
-  "tenantId": "account-uuid"
+  "os": "linux",
+  "arch": "amd64",
+  "version": "dev"
 }
 ```
 
-> IoT Core SQL의 `SELECT *`로 원본 페이로드의 모든 필드가 포함되고,  
-> `topic(2) AS thingName`, `'status' AS event`, `timestamp() AS ts`가 추가됩니다.
+요청 경로는 `POST /api/v1/iot/webhook`이며 `X-IoT-Secret` 헤더가 필요합니다.
+Rule의 변환 설정과 공유 시크릿은 별도로 맞춰야 하며 위 JSON은 서버 입력 예시입니다.
 
-**이벤트 타입별 페이로드:**
+| `category` / `action` | 서버 처리 |
+| --- | --- |
+| `agent / status` | `status`, 선택적 `os/arch/version`으로 상태 갱신·이벤트 저장 |
+| `agent / response` | `commandId/exitCode/data/error`로 명령 결과 갱신·이벤트 저장 |
+| `scan / *` | 스캔 이벤트 저장 |
+| `system / *` | 텔레메트리 이벤트 저장 |
+| `anomaly / *` | 이상치 저장 후 그룹 규칙 비교·알림 |
+| 기타 | `action`으로 해석을 시도하고 일치하지 않으면 텔레메트리로 저장 |
 
-**`event: "status"` - 상태 변경**
+서버는 `thingName`으로 등록 장비를 찾고, 저장 시 해당 장비의 계정을 사용합니다.
+요청의 `tenantId`와 장비 계정을 별도로 대조하는 검증은 현재 없습니다.
+없는 장비는 `{ "ok": true, "warning": "unknown agent" }`로 응답합니다.
+`last_seen_at`은 서버 수신 시각이며, 장비 타임스탬프를 기준으로 갱신하지 않습니다.
 
-```json
-{
-  "thingName": "socquery-agent-xxx",
-  "event": "status",
-  "ts": 1707500000000,
-  "status": "online",
-  "tenantId": "account-uuid"
-}
+## 저장소 구조
+
+```text
+src/
+  index.ts                 # /api/v1, CORS, logger, 라우트 연결
+  routes/
+    auth.ts                # 사용자·세션·계정 전환
+    agents.ts              # 토큰·장비·그룹·규칙·명령 API
+    iot.ts                 # 웹훅·이벤트 처리·알림 채널 전송
+  middleware/auth.ts       # JWT 검증과 요청 컨텍스트
+  utils/crypto.ts          # PBKDF2, SHA-256, UUID
+  utils/jwt.ts             # HS256, refresh token 생성
+  types.ts                 # 바인딩·요청 컨텍스트·DB 행 타입
+migrations/                # 001~008, 순서대로 적용하는 D1 SQL
+wrangler.jsonc             # Worker·D1·공개 설정
+worker-configuration.d.ts   # Wrangler가 생성한 런타임·바인딩 타입
+package-lock.json          # 재현 가능한 의존성 설치 기준
 ```
 
-**`event: "telemetry"` - 시스템 메트릭**
-
-```json
-{
-  "thingName": "socquery-agent-xxx",
-  "event": "telemetry",
-  "ts": 1707500000000,
-  "cpu": 45.2,
-  "memUsed": 72,
-  "memTotal": 100,
-  "diskUsed": 58,
-  "diskTotal": 500,
-  "uptime": 86400,
-  "tenantId": "account-uuid"
-}
-```
-
-**`event: "response"` - 명령 실행 결과**
-
-```json
-{
-  "thingName": "socquery-agent-xxx",
-  "event": "response",
-  "ts": 1707500000000,
-  "commandId": "command-uuid",
-  "exitCode": 0,
-  "output": "명령 실행 결과 텍스트",
-  "tenantId": "account-uuid"
-}
-```
-
-**Response (200):**
-
-```json
-{
-  "ok": true
-}
-```
-
-**백엔드 처리 로직:**
-
-```
-POST /api/v1/iot/webhook 수신
-  │
-  ├─ 1. X-IoT-Secret 헤더 검증 (불일치 시 401)
-  │
-  ├─ 2. thingName으로 agents 테이블 조회
-  │     (존재하지 않으면 무시 또는 로그)
-  │
-  ├─ 3. event 타입별 분기
-  │     │
-  │     ├─ "status"
-  │     │   ├─ agents.status = payload.status
-  │     │   ├─ agents.last_seen_at = NOW
-  │     │   └─ agent_events INSERT (type: "status")
-  │     │
-  │     ├─ "telemetry"
-  │     │   ├─ agents.last_seen_at = NOW
-  │     │   └─ agent_events INSERT (type: "telemetry", data: JSON)
-  │     │
-  │     └─ "response"
-  │         ├─ agent_commands.status = "completed"
-  │         ├─ agent_commands.result = payload.output
-  │         ├─ agent_commands.exit_code = payload.exitCode
-  │         └─ agent_events INSERT (type: "response")
-  │
-  └─ 4. 200 OK 반환
-```
-
-#### `GET /iot/webhook` - AWS IoT HTTPS 확인 (Confirmation)
-
-AWS IoT Core가 HTTPS Action을 최초 설정할 때 확인 요청을 보냅니다.
-
-| 항목   | 값                      |
-| ------ | ----------------------- |
-| 인증   | 불필요                  |
-| 호출자 | AWS IoT Core (최초 1회) |
-
-**처리:** 요청을 수신하면 200 OK를 반환하여 엔드포인트 소유를 확인합니다.
-
----
-
-## 데이터베이스 스키마
-
-### 현재 구현된 테이블
-
-```sql
-accounts              -- 테넌트(조직) 정보
-├── id                -- UUID
-├── name              -- 조직명
-├── plan              -- free / pro / enterprise
-├── status            -- active / inactive / deleted
-├── created_at
-└── updated_at
-
-users                 -- 사용자
-├── id                -- UUID
-├── account_id        -- FK → accounts.id
-├── email             -- UNIQUE
-├── password_hash     -- PBKDF2 (salt:hash)
-├── name
-├── role              -- admin / member
-├── status            -- active / inactive / deleted
-├── created_at
-└── updated_at
-
-account_users         -- 계정-사용자 매핑 (멀티테넌트)
-├── account_id        -- PK, FK → accounts.id
-├── user_id           -- PK, FK → users.id
-├── role              -- owner / admin / viewer
-└── created_at
-
-refresh_tokens        -- 리프레시 토큰 (Rotation 방식)
-├── id                -- UUID
-├── user_id           -- FK → users.id
-├── token_hash        -- SHA-256 해시 (원본 미저장)
-├── device_info       -- 디바이스 정보 (JSON)
-├── expires_at
-├── created_at
-└── revoked_at        -- NULL이면 유효
-```
-
-### 추가 예정 테이블 (장비 관리 + 이벤트)
-
-```sql
-agents                     -- 등록된 에이전트 장비
-├── id                     -- UUID
-├── account_id             -- FK → accounts.id
-├── thing_name             -- AWS IoT Thing 이름 (UNIQUE)
-├── machine_id             -- 머신 고유 ID (해시)
-├── certificate_arn        -- AWS 인증서 ARN
-├── status                 -- online / offline / revoked
-├── last_seen_at           -- 마지막 통신 시각 (웹훅으로 갱신)
-├── created_at
-└── updated_at
-
-agent_events               -- 에이전트 이벤트 로그 (웹훅 수신 기록)
-├── id                     -- UUID
-├── agent_id               -- FK → agents.id
-├── account_id             -- FK → accounts.id (조회 최적화)
-├── type                   -- status / telemetry / response
-├── data                   -- JSON (이벤트 페이로드 전체)
-├── created_at
-└── INDEX (agent_id, type, created_at DESC)
-
-agent_commands             -- 에이전트에 전달한 명령 기록
-├── id                     -- UUID (= commandId)
-├── agent_id               -- FK → agents.id
-├── account_id             -- FK → accounts.id
-├── action                 -- 명령 타입 (scan, exec, update 등)
-├── params                 -- JSON (명령 파라미터)
-├── status                 -- pending / delivered / completed / failed / timeout
-├── exit_code              -- 실행 결과 코드 (response 수신 시 업데이트)
-├── result                 -- TEXT (실행 결과 출력)
-├── created_at             -- 명령 생성 시각
-├── completed_at           -- 실행 완료 시각
-└── INDEX (agent_id, status, created_at DESC)
-
-agent_registration_tokens  -- 장비 등록용 일회성 토큰
-├── id                     -- UUID
-├── account_id             -- FK → accounts.id
-├── token_hash             -- 토큰 해시
-├── used                   -- 사용 여부
-├── expires_at
-└── created_at
-```
-
----
-
-## 보안 설계
-
-### 인증 토큰
-
-| 항목           | 방식                                        |
-| -------------- | ------------------------------------------- |
-| Access Token   | JWT (HS256), 15분 만료                      |
-| Refresh Token  | 랜덤 48바이트 hex, DB에 SHA-256 해시로 저장 |
-| Token Rotation | refresh 사용 시 기존 폐기 + 새 토큰 발급    |
-| 비밀번호 변경  | 모든 세션 강제 로그아웃                     |
-
-### 비밀번호 해싱
-
-| 항목      | 값                      |
-| --------- | ----------------------- |
-| 알고리즘  | PBKDF2                  |
-| 해시 함수 | SHA-256                 |
-| 반복 횟수 | 100,000                 |
-| 키 길이   | 64 bytes                |
-| Salt      | 16 bytes 랜덤           |
-| 저장 형식 | `{salt_hex}:{hash_hex}` |
-
-### 에이전트 보안
-
-| 항목        | 방식                                            |
-| ----------- | ----------------------------------------------- |
-| 등록 토큰   | 일회용, 만료 시간 설정 (구현 예정)              |
-| 인증서 전달 | HTTPS로 1회 전달, 에이전트가 로컬에 암호화 저장 |
-| 로컬 저장   | AES-256-GCM 암호화 (machineID 기반 키 파생)     |
-| MQTT 통신   | mTLS (상호 인증서 기반 TLS 1.2+, 포트 8883)     |
-
----
-
-## MQTT 토픽 설계
-
-| 토픽 패턴                        | 방향          | 용도                        |       IoT Rule 연동       | 페이로드 예시                                            |
-| -------------------------------- | ------------- | --------------------------- | :-----------------------: | -------------------------------------------------------- |
-| `socquery/{thingName}/status`    | Agent → Cloud | 상태 보고 (online/offline)  |             O             | `{"status":"online","thingName":"...","tenantId":"..."}` |
-| `socquery/{thingName}/telemetry` | Agent → Cloud | 텔레메트리 (CPU, 메모리 등) |             O             | `{"cpu":45.2,"memUsed":72,"diskUsed":58,"uptime":86400}` |
-| `socquery/{thingName}/response`  | Agent → Cloud | 명령 실행 결과 응답         |             O             | `{"commandId":"uuid","exitCode":0,"output":"..."}`       |
-| `socquery/{thingName}/command`   | Cloud → Agent | 명령 전달                   | X (백엔드가 직접 Publish) | `{"commandId":"uuid","action":"scan","params":{...}}`    |
-
----
-
-## AWS IoT 정책(Policy) 생성 (필수)
-
-에이전트가 MQTT로 **연결(Connect)**하려면 아래 정책이 **반드시** 있어야 합니다.  
-백엔드는 등록 시 인증서에 `Socquery_SaaS_Agent_policy`를 붙이므로, **이 이름으로 정책을 미리 생성**해 두어야 합니다.
-
-**한 번만 실행하면 됩니다 (리전/계정당 1개):**
-
-```bash
-# policy-document.json 내용으로 정책 생성
-aws iot create-policy \
-  --policy-name Socquery_SaaS_Agent_policy \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": "iot:Connect",
-        "Resource": "arn:aws:iot:*:*:client/${iot:Connection.Thing.ThingName}"
-      },
-      {
-        "Effect": "Allow",
-        "Action": "iot:Publish",
-        "Resource": "arn:aws:iot:*:*:topic/socquery/*/${iot:Connection.Thing.ThingName}/*"
-      },
-      {
-        "Effect": "Allow",
-        "Action": "iot:Subscribe",
-        "Resource": "arn:aws:iot:*:*:topicfilter/socquery/*/${iot:Connection.Thing.ThingName}/agent/command"
-      },
-      {
-        "Effect": "Allow",
-        "Action": "iot:Receive",
-        "Resource": "arn:aws:iot:*:*:topic/socquery/*/${iot:Connection.Thing.ThingName}/agent/command"
-      }
-    ]
-  }'
-```
-
-정책이 없으면 에이전트 연결 시 **EOF** 또는 **Connection Refused** 가 발생합니다.
-
----
-
-## AWS IoT Core 규칙 설계
-
-에이전트가 MQTT로 발행한 메시지를 IoT Core Rules Engine이 캐치하여 백엔드 HTTPS 엔드포인트로 전달합니다.
-
-### 규칙 구성
-
-총 3개의 규칙을 생성하며, 모두 같은 웹훅 엔드포인트(`/api/v1/iot/webhook`)로 전달합니다.  
-토픽 경로의 3번째 세그먼트(`topic(3)`)로 이벤트 타입을 구분합니다.
-
-#### 규칙 1: `socquery_agent_status`
-
-```sql
-SELECT *, topic(2) AS thingName, 'status' AS event, timestamp() AS ts
-FROM 'socquery/+/status'
-```
-
-| 항목        | 값                                                    |
-| ----------- | ----------------------------------------------------- |
-| 트리거 토픽 | `socquery/+/status`                                   |
-| 이벤트 타입 | `status`                                              |
-| 용도        | 에이전트 online/offline 상태 변경 감지                |
-| 백엔드 처리 | `agents.status` 업데이트 + `agents.last_seen_at` 갱신 |
-
-#### 규칙 2: `socquery_agent_telemetry`
-
-```sql
-SELECT *, topic(2) AS thingName, 'telemetry' AS event, timestamp() AS ts
-FROM 'socquery/+/telemetry'
-```
-
-| 항목        | 값                                                 |
-| ----------- | -------------------------------------------------- |
-| 트리거 토픽 | `socquery/+/telemetry`                             |
-| 이벤트 타입 | `telemetry`                                        |
-| 용도        | CPU, 메모리, 디스크 등 시스템 메트릭 수집          |
-| 백엔드 처리 | `agent_events` INSERT + `agents.last_seen_at` 갱신 |
-
-#### 규칙 3: `socquery_agent_response`
-
-```sql
-SELECT *, topic(2) AS thingName, 'response' AS event, timestamp() AS ts
-FROM 'socquery/+/response'
-```
-
-| 항목        | 값                                           |
-| ----------- | -------------------------------------------- |
-| 트리거 토픽 | `socquery/+/response`                        |
-| 이벤트 타입 | `response`                                   |
-| 용도        | 명령 실행 결과 수신                          |
-| 백엔드 처리 | `agent_commands.status` 업데이트 + 결과 저장 |
-
-### 규칙 공통 Action 설정
-
-모든 규칙의 HTTPS Action은 동일한 설정을 사용합니다:
-
-| 항목         | 값                                                         |
-| ------------ | ---------------------------------------------------------- |
-| Action 타입  | HTTPS                                                      |
-| URL          | `https://socquery.com/api/v1/iot/webhook`                  |
-| 인증         | 커스텀 헤더 (`X-IoT-Secret`)                               |
-| Content-Type | `application/json`                                         |
-| 확인 URL     | 최초 설정 시 AWS가 확인 요청을 보냄 (백엔드에서 처리 필요) |
-
-### AWS IoT 규칙 생성 CLI 예시
-
-```bash
-# 규칙 1: status
-aws iot create-topic-rule \
-  --rule-name socquery_agent_status \
-  --topic-rule-payload '{
-    "sql": "SELECT *, topic(2) AS thingName, '\''status'\'' AS event, timestamp() AS ts FROM '\''socquery/+/status'\''",
-    "actions": [{
-      "http": {
-        "url": "https://socquery.com/api/v1/iot/webhook",
-        "headers": [{"key": "X-IoT-Secret", "value": "${IOT_WEBHOOK_SECRET}"}],
-        "confirmationUrl": "https://socquery.com/api/v1/iot/webhook"
-      }
-    }]
-  }'
-
-# 규칙 2: telemetry
-aws iot create-topic-rule \
-  --rule-name socquery_agent_telemetry \
-  --topic-rule-payload '{
-    "sql": "SELECT *, topic(2) AS thingName, '\''telemetry'\'' AS event, timestamp() AS ts FROM '\''socquery/+/telemetry'\''",
-    "actions": [{
-      "http": {
-        "url": "https://socquery.com/api/v1/iot/webhook",
-        "headers": [{"key": "X-IoT-Secret", "value": "${IOT_WEBHOOK_SECRET}"}],
-        "confirmationUrl": "https://socquery.com/api/v1/iot/webhook"
-      }
-    }]
-  }'
-
-# 규칙 3: response
-aws iot create-topic-rule \
-  --rule-name socquery_agent_response \
-  --topic-rule-payload '{
-    "sql": "SELECT *, topic(2) AS thingName, '\''response'\'' AS event, timestamp() AS ts FROM '\''socquery/+/response'\''",
-    "actions": [{
-      "http": {
-        "url": "https://socquery.com/api/v1/iot/webhook",
-        "headers": [{"key": "X-IoT-Secret", "value": "${IOT_WEBHOOK_SECRET}"}],
-        "confirmationUrl": "https://socquery.com/api/v1/iot/webhook"
-      }
-    }]
-  }'
-```
-
----
-
-## 환경 변수
-
-| 변수                     | 설명                    | 예시                                         |
-| ------------------------ | ----------------------- | -------------------------------------------- |
-| `DB`                     | D1 데이터베이스 바인딩  | (wrangler.jsonc에서 설정)                    |
-| `JWT_SECRET`             | JWT 서명 키             | `wrangler secret put JWT_SECRET`             |
-| `JWT_ACCESS_EXPIRES_IN`  | Access Token 만료 (초)  | `900` (15분)                                 |
-| `JWT_REFRESH_EXPIRES_IN` | Refresh Token 만료 (초) | `604800` (7일)                               |
-| `AWS_ACCESS_KEY_ID`      | AWS IAM Access Key      | `wrangler secret put`                        |
-| `AWS_SECRET_ACCESS_KEY`  | AWS IAM Secret Key      | `wrangler secret put`                        |
-| `AWS_REGION`             | AWS 리전                | `ap-northeast-2`                             |
-| `IOT_ATS_ENDPOINT`       | AWS IoT ATS 엔드포인트  | `xxxxx-ats.iot.ap-northeast-2.amazonaws.com` |
-| `IOT_WEBHOOK_SECRET`     | IoT 웹훅 인증 시크릿    | `wrangler secret put IOT_WEBHOOK_SECRET`     |
-| `RESEND_API_KEY`         | Resend API 키           | `wrangler secret put RESEND_API_KEY`         |
-| `RESEND_FROM_EMAIL`      | 알람 발신자 이메일      | `alerts@socquery.com`                        |
-
----
-
-## 개발 및 배포
-
-### 로컬 개발
-
-```bash
-npm install
-npm run dev
-```
-
-### 배포
-
-```bash
-npm run deploy
-```
-
-### D1 마이그레이션
-
-```bash
-# 로컬
-wrangler d1 execute socquery-saas-d1 --local --file=./migrations/001_initial_schema.sql
-
-# 프로덕션
-wrangler d1 execute socquery-saas-d1 --remote --file=./migrations/001_initial_schema.sql
-```
-
-### 시크릿 설정
-
-```bash
-wrangler secret put JWT_SECRET
-wrangler secret put AWS_ACCESS_KEY_ID
-wrangler secret put AWS_SECRET_ACCESS_KEY
-wrangler secret put IOT_ATS_ENDPOINT
-wrangler secret put IOT_WEBHOOK_SECRET
-wrangler secret put RESEND_API_KEY
-wrangler secret put RESEND_FROM_EMAIL
-```
-
----
-
-## TODO (구현 예정)
-
-**인증/라우팅:**
-
-- [ ] auth 라우트를 index.ts에 마운트 (`app.route('/auth', auth)`)
-- [ ] 에이전트 등록 API에 인증 미들웨어 적용
-
-**장비 등록:**
-
-- [ ] 장비 등록 토큰 발급 API (`POST /api/v1/agents/token`)
-- [ ] 장비 등록 시 토큰 검증 + tenant_id 연결
-- [ ] `agents`, `agent_events`, `agent_commands` 테이블 마이그레이션 추가
-
-**장비 관리 API:**
-
-- [ ] 장비 목록 조회 API (`GET /api/v1/agents`)
-- [ ] 장비 상태 조회 API (`GET /api/v1/agents/:id`)
-- [ ] 장비 이벤트 이력 조회 API (`GET /api/v1/agents/:id/events`)
-- [ ] 장비 삭제 API (인증서 폐기 포함)
-
-**IoT 웹훅:**
-
-- [ ] `POST /api/v1/iot/webhook` 구현 (이벤트 수신 + 라우팅)
-- [ ] `GET /api/v1/iot/webhook` 구현 (AWS IoT HTTPS 확인)
-- [ ] `X-IoT-Secret` 시크릿 검증 미들웨어
-- [ ] 이벤트 타입별 처리 (status → agents 업데이트, telemetry → events 저장, response → commands 업데이트)
-- [ ] AWS IoT Core 규칙 3개 생성 (status, telemetry, response)
-
-**명령 전달:**
-
-- [ ] MQTT 명령 전달 API (`POST /api/v1/agents/:id/command`)
-- [ ] 명령 이력 조회 API (`GET /api/v1/agents/:id/commands`)
-- [ ] 명령 타임아웃 처리 (일정 시간 내 response 미수신 시 timeout)
-
-**에이전트 텔레메트리:**
-
-- [ ] 에이전트에 주기적 telemetry 발행 로직 추가 (Go client-agent)
-- [ ] 에이전트에 command 수신 → 실행 → response 발행 로직 추가 (Go client-agent)
+SQL은 계정·소속, 장비·등록 토큰, 그룹·규칙·채널, 이벤트·명령·알림 이력을 연결합니다.
+그룹 분류, 웹훅 옵션, 장비 표시 이름과 알림 발생 이력을 순차 마이그레이션으로 추가했습니다.
+
+## 검증 방법과 현재 범위
+
+2026-11-05에 로컬 환경에서 다음 항목을 확인했습니다.
+API 검증은 Wrangler의 `127.0.0.1` 서버와 로컬 D1을 사용했으며, 아래 10개 응답 확인이 모두 통과했습니다.
+
+| 검증 항목 | 결과 |
+| --- | --- |
+| 의존성 설치 | `npm ci --ignore-scripts` 통과 |
+| 정적 타입 검사 | 별도로 실행한 최신 TypeScript compiler의 `tsc --noEmit` 통과 |
+| 로컬 DB | D1 마이그레이션 8개 적용 성공 |
+| 기본 응답·인증 경계 | health `200`, 미인증 장비 조회 `401` |
+| 가입·로그인 | 회원가입 `201`, 로그인 `200` |
+| 인증 후 조회 | 내 정보 `200`, 장비 빈 목록 `200` |
+| 토큰 회전 | refresh `200`, 기존 refresh token 재사용 `401` |
+| 세션 폐기 | 로그아웃 `200`, 폐기한 refresh token 재사용 `401` |
+
+토큰·비밀번호 값은 검증 출력이나 결과 파일에 남기지 않았습니다.
+AWS·Resend 호출, Go 에이전트와의 실계정 통합, 실장비 운영·부하 테스트는 수행하지 않았습니다.
+클라우드 배포 상태·가동률·성능·보안 수준을 이 로컬 결과로 보장하지 않습니다.
+
+현재 `npm test`, lint, typecheck 전용 npm 스크립트는 없습니다.
+위 확인은 저장소에 상시 실행 가능한 자동 테스트가 구축되어 있다는 뜻은 아닙니다.
+다음 검증 대상으로는 AWS 모의 응답을 이용한 등록 중간 실패·중복 요청·명령 응답과,
+별도 테스트 AWS 환경에서 에이전트·IoT Rule·웹훅의 전체 연결을 남겨 두었습니다.
+
+
+## 알려진 제약과 다음 작업
+
+- **통신 계약 검증:** Go 수신 형식과 서버 발행 형식, Rule의 평탄화 입력을 테스트로 고정할 예정입니다.
+- **프로비저닝 일관성:** AWS 단계와 DB 저장을 하나의 트랜잭션으로 묶지 않았고, 중간 실패 시 보상 정리는 없습니다.
+- **동시 요청:** 등록 토큰 사용 처리와 refresh 회전의 원자성·중복 요청 검증을 보완해야 합니다.
+- **명령 타임아웃:** 타입·저장 필드는 있으나 응답 누락을 자동 만료 처리하는 스케줄러는 없습니다.
+- **알림 전달:** 요청 처리 중 순차 전송하며 실패는 로그에 남깁니다. 재시도 큐·전송 성공 이력은 없습니다.
+- **장비 삭제:** AWS 정리를 시도한 뒤 DB를 삭제합니다. AWS 요청 실패·잔여 리소스 정리는 보강 대상입니다.
+- **입력·권한:** 요청 스키마와 역할별 권한, 웹훅의 계정 대조, 외부 전송 대상 검증을 더 엄격히 할 필요가 있습니다.
+- **운영 설정:** 현재 CORS는 전체 origin 허용이며 observability 설정은 주석 상태입니다. 환경별 제한·관측을 보완할 예정입니다.
+
+이 항목들은 개발 완료 목록과 구분한 후속 작업입니다.
+
+## 참고 문서
+
+- [Cloudflare D1 로컬 개발](https://developers.cloudflare.com/d1/best-practices/local-development/)
+- [Wrangler D1 마이그레이션](https://developers.cloudflare.com/d1/wrangler-commands/#d1-migrations-apply)
+- [Workers 로컬 시크릿](https://developers.cloudflare.com/workers/configuration/secrets/#local-development-with-secrets)
+- [Workers Best Practices](https://developers.cloudflare.com/workers/best-practices/workers-best-practices/)
+
+현재 별도 `LICENSE` 파일은 포함되어 있지 않습니다.
